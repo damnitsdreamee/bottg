@@ -22,8 +22,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================
 
 BOT_TOKEN = "8672440419:AAHCbJmOkUBdrqioCBHUieQWpQ2gii3sY00"
-STAROSTA_CHAT_ID = -1003869910543  # чат старост
-ADMIN_IDS = {997225365, 1033734417, 6273760899}  # id старост
+STAROSTA_CHAT_ID = -1003869910543
+ADMIN_IDS = {997225365, 1033734417, 6273760899}
 DB_PATH = "support_bot.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +35,8 @@ bot = Bot(
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-
+last_message_time = {}
+COOLDOWN = 15
 
 # =========================
 # FSM
@@ -44,13 +45,13 @@ dp.include_router(router)
 class ReplyState(StatesGroup):
     waiting_for_reply_text = State()
 
-
 # =========================
 # DATABASE
 # =========================
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # создаём таблицы если нет
         await db.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,26 +61,45 @@ async def init_db():
             text TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'new',
             assigned_admin_id INTEGER,
+            assigned_admin_name TEXT,
             created_at TEXT NOT NULL,
             admin_message_id INTEGER
         )
         """)
 
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS replies (
+        CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER NOT NULL,
-            admin_id INTEGER NOT NULL,
-            admin_name TEXT NOT NULL,
-            reply_text TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            text TEXT,
             created_at TEXT NOT NULL
         )
         """)
 
+        # 🔥 МИГРАЦИИ (если таблица старая)
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN file_id TEXT")
+        except:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN file_type TEXT")
+        except:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE requests ADD COLUMN assigned_admin_name TEXT")
+        except:
+            pass
+
         await db.commit()
 
+# =========================
+# DB FUNCTIONS
+# =========================
 
-async def create_request(student_id: int, username: str | None, full_name: str, text: str):
+async def create_request(student_id, username, full_name, text):
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
@@ -90,337 +110,391 @@ async def create_request(student_id: int, username: str | None, full_name: str, 
         await db.commit()
         return cursor.lastrowid
 
-
-async def set_admin_message_id(request_id: int, admin_message_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        UPDATE requests
-        SET admin_message_id = ?
-        WHERE id = ?
-        """, (admin_message_id, request_id))
-        await db.commit()
-
-
-async def get_request(request_id: int):
+async def get_request(request_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
-        SELECT * FROM requests WHERE id = ?
-        """, (request_id,))
+        cursor = await db.execute("SELECT * FROM requests WHERE id = ?", (request_id,))
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-
-async def assign_request(request_id: int, admin_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        UPDATE requests
-        SET status = 'in_progress',
-            assigned_admin_id = ?
-        WHERE id = ?
-        """, (admin_id, request_id))
-        await db.commit()
-
-
-async def close_request(request_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        UPDATE requests
-        SET status = 'closed'
-        WHERE id = ?
-        """, (request_id,))
-        await db.commit()
-
-
-async def add_reply(request_id: int, admin_id: int, admin_name: str, reply_text: str):
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        INSERT INTO replies (
-            request_id, admin_id, admin_name, reply_text, created_at
-        ) VALUES (?, ?, ?, ?, ?)
-        """, (request_id, admin_id, admin_name, reply_text, created_at))
-        await db.commit()
-
-
-async def get_replies(request_id: int):
+async def get_active_request(student_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
-        SELECT * FROM replies
-        WHERE request_id = ?
-        ORDER BY id ASC
+        SELECT * FROM requests
+        WHERE student_id = ? AND status != 'closed'
+        ORDER BY id DESC LIMIT 1
+        """, (student_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def assign_request(request_id, admin_id, admin_name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        UPDATE requests
+        SET assigned_admin_id = ?, assigned_admin_name = ?, status = 'in_progress'
+        WHERE id = ?
+        """, (admin_id, admin_name, request_id))
+        await db.commit()
+
+async def close_request(request_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE requests SET status='closed' WHERE id=?", (request_id,))
+        await db.commit()
+
+async def reopen_request(request_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT student_id FROM requests WHERE id = ?",
+            (request_id,)
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return
+
+        student_id = row[0]
+
+        await db.execute("""
+        UPDATE requests
+        SET status = 'closed'
+        WHERE student_id = ? AND id != ?
+        """, (student_id, request_id))
+
+        await db.execute("""
+        UPDATE requests
+        SET status = 'in_progress'
+        WHERE id = ?
         """, (request_id,))
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
 
+        await db.commit()
+
+async def add_message(request_id, sender, text=None, file_id=None, file_type=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO messages (request_id, sender, text, file_id, file_type, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (request_id, sender, text, file_id, file_type,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        await db.commit()
+
+async def get_messages(request_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+        SELECT * FROM messages WHERE request_id=? ORDER BY id ASC
+        """, (request_id,))
+        return [dict(r) for r in await cursor.fetchall()]
 
 # =========================
-# KEYBOARDS
+# KEYBOARD
 # =========================
 
-def request_keyboard(request_id: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="Взять в работу", callback_data=f"take:{request_id}"),
-        InlineKeyboardButton(text="Ответить", callback_data=f"reply:{request_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="Закрыть", callback_data=f"close:{request_id}")
-    )
-    return builder.as_markup()
+def request_keyboard(request_id: int, status: str):
+    kb = InlineKeyboardBuilder()
 
+    if status in ("new", "in_progress"):
+        kb.row(
+            InlineKeyboardButton(text="🙋 Взять", callback_data=f"take:{request_id}"),
+            InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply:{request_id}")
+        )
+        kb.row(
+            InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close:{request_id}")
+        )
+    else:
+        kb.row(
+            InlineKeyboardButton(text="🔄 Переоткрыть", callback_data=f"reopen:{request_id}")
+        )
+
+    
+
+    return kb.as_markup()
 
 # =========================
 # HELPERS
 # =========================
 
-def format_request_card(request_data: dict, replies: list[dict] | None = None) -> str:
-    status_map = {
-        "new": "🟡 Новое",
-        "in_progress": "🟠 В работе",
-        "closed": "✅ Закрыто",
-    }
-
-    username = (
-        f"@{request_data['student_username']}"
-        if request_data["student_username"] else "без username"
-    )
-
-    text = (
-        f"<b>Обращение #{request_data['id']}</b>\n"
-        f"Статус: {status_map.get(request_data['status'], request_data['status'])}\n"
-        f"Студент: {request_data['student_name']}\n"
-        f"Username: {username}\n"
-        f"Student ID: <code>{request_data['student_id']}</code>\n"
-        f"Создано: {request_data['created_at']}\n\n"
-        f"<b>Сообщение:</b>\n{request_data['text']}"
-    )
-
-    if request_data.get("assigned_admin_id"):
-        text += f"\n\n👤 Взял в работу: <code>{request_data['assigned_admin_id']}</code>"
-
-    if replies:
-        text += "\n\n<b>Ответы:</b>"
-        for reply in replies[-5:]:
-            text += (
-                f"\n— <b>{reply['admin_name']}</b>: {reply['reply_text']}"
-            )
-
-    return text
-
-
-async def refresh_admin_message(request_id: int):
-    request_data = await get_request(request_id)
-    if not request_data or not request_data.get("admin_message_id"):
-        return
-
-    replies = await get_replies(request_id)
-    text = format_request_card(request_data, replies)
-
-    try:
-        await bot.edit_message_text(
-            chat_id=STAROSTA_CHAT_ID,
-            message_id=request_data["admin_message_id"],
-            text=text,
-            reply_markup=request_keyboard(request_id)
-        )
-    except Exception:
-        # если сообщение нельзя отредактировать, просто игнорируем
-        pass
-
-
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id: int):
     return user_id in ADMIN_IDS
 
+def format_request_card(r):
+    username = f"@{r['student_username']}" if r['student_username'] else "-"
+    assigned = r.get("assigned_admin_name") or "никто"
+
+    return (
+        f"<b>Тикет #{r['id']}</b>\n"
+        f"👤 {r['student_name']} ({username})\n"
+        f"🆔 <code>{r['student_id']}</code>\n"
+        f"👨‍💼 Староста: {assigned}\n\n"
+        f"{r['text']}"
+    )
 
 # =========================
-# STUDENT SIDE
+# STUDENT
 # =========================
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    await message.answer(
-        "👋 Привет!\n"
-        "Это бот для обращений к старостам БИСО-03-25.\n"
-        "✉️ Если у тебя есть какой-либо вопрос или проблема - нажми на кнопку <b>\"Задать вопрос\"</b> он будет зарегистрирован и отправлен старостам.\n"
-        "<u>Ты получишь ответ здесь.</u>\n"
-        "❗️<i> Не пиши старостам в личные — используй этот бот.</i>"
-    )
+async def start(message: Message):
+    await message.answer("""👋 Привет !
 
+Это бот для обращений к старостам группы БИСО-03-25.
 
-@router.message(F.chat.type == "private", F.text)
-async def handle_student_message(message: Message):
-    if is_admin(message.from_user.id):
-        return
+✉ Если у тебя есть какой-либо вопрос или проблема - напиши его мне и он будет отправлен старостам.
 
-    request_id = await create_request(
-        student_id=message.from_user.id,
-        username=message.from_user.username,
-        full_name=message.from_user.full_name,
-        text=message.text,
-    )
+<u>Ты получишь ответ здесь.</u>
 
-    request_data = await get_request(request_id)
-    admin_text = format_request_card(request_data)
-
-    sent = await bot.send_message(
-        chat_id=STAROSTA_CHAT_ID,
-        text=admin_text,
-        reply_markup=request_keyboard(request_id)
-    )
-
-    await set_admin_message_id(request_id, sent.message_id)
-
-    await message.answer(
-        f"✅ Твоё обращение отправлено старостам.\n"
-        f"Номер обращения: <b>#{request_id}</b>\n\n"
-        f"Когда кто-то из старост ответит, бот пришлёт сообщение сюда."
-    )
-
+❗️<i> Не пиши старостам в личные — используй этот бот.</i>""")
 
 @router.message(F.chat.type == "private")
-async def handle_non_text_student_message(message: Message):
+async def handle_student(message: Message):
     if is_admin(message.from_user.id):
         return
 
-    await message.answer("Пока что бот принимает только текстовые обращения.")
+    # ⏳ антиспам
+    user_id = message.from_user.id
+    now = datetime.now().timestamp()
 
+    if user_id in last_message_time:
+        diff = now - last_message_time[user_id]
 
+        if diff < COOLDOWN:
+            wait = int(COOLDOWN - diff)
+            await message.answer(f"⏳ Подожди {wait} сек")
+            return
+
+    last_message_time[user_id] = now
+
+    active = await get_active_request(message.from_user.id)
+
+    text = message.text
+    file_id = None
+    file_type = None
+
+    if message.voice:
+        file_id = message.voice.file_id
+        file_type = "voice"
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+    elif message.document:
+        file_id = message.document.file_id
+        file_type = "document"
+
+    # =========================
+    # ЕСЛИ ЕСТЬ ТИКЕТ
+    # =========================
+    if active:
+        rid = active["id"]
+
+        await add_message(rid, "user", text, file_id, file_type)
+
+        if file_id:
+            if file_type == "photo":
+                await bot.send_photo(STAROSTA_CHAT_ID, file_id, caption=f"📎 Вопрос #{rid}")
+            elif file_type == "voice":
+                await bot.send_voice(STAROSTA_CHAT_ID, file_id)
+            elif file_type == "document":
+                await bot.send_document(STAROSTA_CHAT_ID, file_id)
+        else:
+            await bot.send_message(STAROSTA_CHAT_ID, f"💬 #{rid}: {text}")
+
+        await message.answer(f"✉️ Вопрос ушел #{rid}")
+        return
+
+    # =========================
+    # СОЗДАНИЕ ТИКЕТА
+    # =========================
+    rid = await create_request(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.full_name,
+        text or "[файл]"
+    )
+
+    await add_message(rid, "user", text, file_id, file_type)
+
+    req = await get_request(rid)
+
+    if file_id:
+        if file_type == "photo":
+            await bot.send_photo(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=format_request_card(req),
+                reply_markup=request_keyboard(rid, "new")
+            )
+        elif file_type == "voice":
+            await bot.send_voice(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=format_request_card(req),
+                reply_markup=request_keyboard(rid, "new")
+            )
+        elif file_type == "document":
+            await bot.send_document(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=format_request_card(req),
+                reply_markup=request_keyboard(rid, "new")
+            )
+    else:
+        await bot.send_message(
+            STAROSTA_CHAT_ID,
+            format_request_card(req),
+            reply_markup=request_keyboard(rid, "new")
+        )
+
+    await message.answer(f"✅ Вопрос #{rid}")
 # =========================
-# ADMIN SIDE
+# ADMIN
 # =========================
 
 @router.callback_query(F.data.startswith("take:"))
-async def take_request(callback: CallbackQuery):
+async def take(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    request_id = int(callback.data.split(":")[1])
-    request_data = await get_request(request_id)
+    rid = int(callback.data.split(":")[1])
 
-    if not request_data:
-        await callback.answer("Обращение не найдено", show_alert=True)
-        return
+    await assign_request(rid, callback.from_user.id, callback.from_user.full_name)
 
-    if request_data["status"] == "closed":
-        await callback.answer("Обращение уже закрыто", show_alert=True)
-        return
-
-    await assign_request(request_id, callback.from_user.id)
-    await refresh_admin_message(request_id)
-
-    await callback.answer("Обращение взято в работу")
-
-
-@router.callback_query(F.data.startswith("reply:"))
-async def reply_request(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    request_id = int(callback.data.split(":")[1])
-    request_data = await get_request(request_id)
-
-    if not request_data:
-        await callback.answer("Обращение не найдено", show_alert=True)
-        return
-
-    if request_data["status"] == "closed":
-        await callback.answer("Обращение уже закрыто", show_alert=True)
-        return
-
-    await state.set_state(ReplyState.waiting_for_reply_text)
-    await state.update_data(request_id=request_id)
-
-    await callback.message.answer(
-        f"Напиши ответ для обращения #{request_id}.\n"
-        f"Он будет отправлен студенту от имени бота."
-    )
-    await callback.answer()
-
-
-@router.message(ReplyState.waiting_for_reply_text)
-async def process_reply_text(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    data = await state.get_data()
-    request_id = data["request_id"]
-
-    request_data = await get_request(request_id)
-    if not request_data:
-        await message.answer("Обращение не найдено.")
-        await state.clear()
-        return
-
-    if request_data["status"] == "closed":
-        await message.answer("Обращение уже закрыто.")
-        await state.clear()
-        return
-
-    admin_name = message.from_user.full_name
-    reply_text = message.text
-
-    await add_reply(request_id, message.from_user.id, admin_name, reply_text)
-
-    # если ещё никто не взял, автоматически назначим отвечающего
-    if not request_data["assigned_admin_id"]:
-        await assign_request(request_id, message.from_user.id)
-
-    student_text = (
-        f"📩 Ответ от старосты по обращению <b>#{request_id}</b>:\n\n"
-        f"{reply_text}"
-    )
+    # 🔥 обновляем карточку (ник того кто взял)
+    req = await get_request(rid)
 
     try:
-        await bot.send_message(request_data["student_id"], student_text)
-    except Exception:
-        await message.answer(
-            "Не удалось отправить ответ студенту.\n"
-            "Возможно, он ещё не запускал бота или заблокировал его."
+        await bot.edit_message_text(
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=format_request_card(req),
+            reply_markup=request_keyboard(rid, "in_progress")
         )
-        await state.clear()
-        return
+    except Exception as e:
+        print("EDIT TAKE ERROR:", e)
 
-    await refresh_admin_message(request_id)
+    await callback.answer("Ты отвечаешь на вопрос")
 
-    await message.answer(f"Ответ по обращению #{request_id} отправлен.")
+@router.callback_query(F.data.startswith("reply:"))
+async def reply(callback: CallbackQuery, state: FSMContext):
+    rid = int(callback.data.split(":")[1])
+    await state.set_state(ReplyState.waiting_for_reply_text)
+    await state.update_data(rid=rid)
+    await callback.message.answer("Введите ответ")
+
+@router.message(ReplyState.waiting_for_reply_text)
+async def send_reply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    rid = data["rid"]
+
+    await add_message(rid, "admin", message.text)
+
+    req = await get_request(rid)
+
+    await bot.send_message(
+        req["student_id"],
+        f"💬 Ответ на вопрос #{rid}:\n{message.text}"
+    )
+
+    await message.answer("Отправлено")
     await state.clear()
 
-
 @router.callback_query(F.data.startswith("close:"))
-async def close_request_handler(callback: CallbackQuery):
+async def close(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    request_id = int(callback.data.split(":")[1])
-    request_data = await get_request(request_id)
+    rid = int(callback.data.split(":")[1])
 
-    if not request_data:
-        await callback.answer("Обращение не найдено", show_alert=True)
+    await close_request(rid)
+
+    req = await get_request(rid)
+
+    # уведомляем пользователя
+    try:
+        await bot.send_message(
+            req["student_id"],
+            f"✅ Вопрос #{rid} закрыт"
+        )
+    except Exception as e:
+        print("USER SEND ERROR:", e)
+
+    # 🔥 обновляем карточку + кнопки (появится reopen)
+    try:
+        await bot.edit_message_text(
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=format_request_card(req),
+            reply_markup=request_keyboard(rid, "closed")
+        )
+    except Exception as e:
+        print("EDIT CLOSE ERROR:", e)
+
+    await callback.answer("Закрыто")
+
+@router.callback_query(F.data.startswith("reopen:"))
+async def reopen(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
         return
 
-    if request_data["status"] == "closed":
-        await callback.answer("Уже закрыто", show_alert=True)
+    rid = int(callback.data.split(":")[1])
+
+    await reopen_request(rid)
+
+    req = await get_request(rid)
+
+    # уведомляем пользователя
+    try:
+        await bot.send_message(
+            req["student_id"],
+            f"🔄 Вопрос #{rid} снова открыт"
+        )
+    except:
+        pass
+
+    # 🔥 ВАЖНО: обновляем кнопки обратно на "закрыть"
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=STAROSTA_CHAT_ID,
+            message_id=callback.message.message_id,
+            reply_markup=request_keyboard(rid, "in_progress")
+        )
+    except:
+        pass
+
+    await callback.answer("Переоткрыто")
+
+
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+
+@router.message(F.text.startswith("/close"))
+async def close_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа")
         return
 
-    await close_request(request_id)
-    await refresh_admin_message(request_id)
+    try:
+        rid = int(message.text.split()[1])
+    except:
+        await message.answer("Используй: /close ID")
+        return
+
+    await close_request(rid)
+
+    req = await get_request(rid)
 
     try:
         await bot.send_message(
-            request_data["student_id"],
-            f"✅ Обращение <b>#{request_id}</b> закрыто."
+            req["student_id"],
+            f"✅ Вопрос #{rid} закрыт старостой"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print("USER SEND ERROR:", e)
 
-    await callback.answer("Обращение закрыто")
-
+    await message.answer(f"Вопрос #{rid} закрыт ✅")
 
 # =========================
 # MAIN
@@ -429,7 +503,6 @@ async def close_request_handler(callback: CallbackQuery):
 async def main():
     await init_db()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
