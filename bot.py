@@ -1,5 +1,4 @@
 import asyncio
-from email.mime import message
 import logging
 import html
 from datetime import datetime
@@ -22,9 +21,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # CONFIG
 # =========================
 
-BOT_TOKEN = "8672440419:AAHCbJmOkUBdrqioCBHUieQWpQ2gii3sY00"
-STAROSTA_CHAT_ID = -1003869910543
-ADMIN_IDS = {997225365, 1033734417, 6273760899}
+BOT_TOKEN = "xxx"
+STAROSTA_CHAT_ID = xxx
+ADMIN_IDS = {xxx, xxx, xxx}
 DB_PATH = "support_bot.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +39,7 @@ dp.include_router(router)
 
 last_message_time = {}
 COOLDOWN = 15
-student_topic_locks = {}
+
 
 # =========================
 # FSM
@@ -90,8 +89,7 @@ async def init_db():
             student_id INTEGER PRIMARY KEY,
             telegram_full_name TEXT,
             username TEXT,
-            custom_name TEXT,
-            forum_topic_id INTEGER
+            custom_name TEXT
         )
         """)
 
@@ -102,7 +100,6 @@ async def init_db():
             "ALTER TABLE requests ADD COLUMN assigned_admin_name TEXT",
             "ALTER TABLE requests ADD COLUMN admin_message_id INTEGER",
             "ALTER TABLE requests ADD COLUMN admin_message_kind TEXT",
-            "ALTER TABLE students ADD COLUMN forum_topic_id INTEGER",
         ]
 
         for query in migrations:
@@ -117,11 +114,6 @@ async def init_db():
 # =========================
 # DB FUNCTIONS
 # =========================
-
-def get_student_lock(student_id: int):
-    if student_id not in student_topic_locks:
-        student_topic_locks[student_id] = asyncio.Lock()
-    return student_topic_locks[student_id]
 
 async def upsert_student(student_id, telegram_full_name, username, custom_name=None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -169,95 +161,6 @@ async def get_student(student_id):
         return dict(row) if row else None
 
 
-async def get_student_topic_id(student_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT forum_topic_id FROM students WHERE student_id = ?",
-            (student_id,)
-        )
-        row = await cursor.fetchone()
-        return row[0] if row and row[0] else None
-
-
-async def set_student_topic_id(student_id, forum_topic_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        UPDATE students
-        SET forum_topic_id = ?
-        WHERE student_id = ?
-        """, (forum_topic_id, student_id))
-        await db.commit()
-
-
-def build_student_topic_name(student: dict, student_id: int):
-    custom_name = student.get("custom_name")
-    username = student.get("username")
-
-    if custom_name and username:
-        base = f"{custom_name} | @{username}"
-    elif custom_name:
-        base = custom_name
-    elif username:
-        base = f"@{username}"
-    else:
-        base = student.get("telegram_full_name") or f"ID {student_id}"
-
-    return (f"{base} | {student_id}")[:128]
-
-
-def get_student_lock(student_id: int):
-    if student_id not in student_topic_locks:
-        student_topic_locks[student_id] = asyncio.Lock()
-    return student_topic_locks[student_id]
-
-
-async def get_or_create_student_topic(student_id: int, force_recreate: bool = False):
-    lock = get_student_lock(student_id)
-
-    async with lock:
-        if force_recreate:
-            await set_student_topic_id(student_id, None)
-
-        topic_id = await get_student_topic_id(student_id)
-        if topic_id:
-            return topic_id
-
-        student = await get_student(student_id)
-        if not student:
-            return None
-
-        topic_name = build_student_topic_name(student, student_id)
-
-        topic = await bot.create_forum_topic(
-            chat_id=STAROSTA_CHAT_ID,
-            name=topic_name
-        )
-
-        await set_student_topic_id(student_id, topic.message_thread_id)
-        return topic.message_thread_id
-
-
-async def rename_student_topic_if_exists(student_id: int):
-    topic_id = await get_student_topic_id(student_id)
-    if not topic_id:
-        return
-
-    student = await get_student(student_id)
-    if not student:
-        return
-
-    topic_name = build_student_topic_name(student, student_id)
-
-    try:
-        await bot.edit_forum_topic(
-            chat_id=STAROSTA_CHAT_ID,
-            message_thread_id=topic_id,
-            name=topic_name
-        )
-    except Exception as e:
-        print(f"TOPIC RENAME ERROR for {student_id}: {e}")
-
-
 async def get_student_display(student_id):
     student = await get_student(student_id)
 
@@ -278,6 +181,7 @@ async def get_student_display(student_id):
         return html.escape(telegram_full_name)
 
     return f"ID {student_id}"
+
 
 async def create_request(student_id, username, full_name, text):
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -457,9 +361,6 @@ def extract_message_content(message: Message):
     if message.photo:
         file_id = message.photo[-1].file_id
         file_type = "photo"
-    elif message.video:
-        file_id = message.video.file_id
-        file_type = "video"
     elif message.voice:
         file_id = message.voice.file_id
         file_type = "voice"
@@ -473,228 +374,8 @@ def extract_message_content(message: Message):
     return text, file_id, file_type
 
 
-async def send_content(
-    chat_id: int,
-    text=None,
-    file_id=None,
-    file_type=None,
-    prefix=None,
-    message_thread_id=None
-):
+async def send_content(chat_id: int, text=None, file_id=None, file_type=None, prefix=None):
     safe_prefix = prefix or ""
-
-    if file_id:
-        caption = safe_prefix
-        if text:
-            caption = f"{safe_prefix}\n{text}" if safe_prefix else text
-
-        if file_type == "photo":
-            await bot.send_photo(
-                chat_id,
-                file_id,
-                caption=caption or None,
-                message_thread_id=message_thread_id
-            )
-        elif file_type == "video":
-            await bot.send_video(
-                chat_id,
-                file_id,
-                caption=caption or None,
-                message_thread_id=message_thread_id
-            )
-        elif file_type == "voice":
-            await bot.send_voice(
-                chat_id,
-                file_id,
-                caption=caption or None,
-                message_thread_id=message_thread_id
-            )
-        elif file_type == "document":
-            await bot.send_document(
-                chat_id,
-                file_id,
-                caption=caption or None,
-                message_thread_id=message_thread_id
-            )
-        elif file_type == "animation":
-            await bot.send_animation(
-                chat_id,
-                file_id,
-                caption=caption or None,
-                message_thread_id=message_thread_id
-            )
-        else:
-            await bot.send_message(
-                chat_id,
-                caption or "[файл]",
-                message_thread_id=message_thread_id
-            )
-    else:
-        if text:
-            msg = f"{safe_prefix}\n{text}" if safe_prefix else text
-            await bot.send_message(
-                chat_id,
-                msg,
-                message_thread_id=message_thread_id
-            )
-
-async def send_to_student_topic(student_id, text=None, file_id=None, file_type=None, prefix=None):
-    topic_id = await get_or_create_student_topic(student_id)
-    if not topic_id:
-        raise RuntimeError("Не удалось получить тему студента")
-
-    try:
-        await send_content(
-            STAROSTA_CHAT_ID,
-            text=text,
-            file_id=file_id,
-            file_type=file_type,
-            prefix=prefix,
-            message_thread_id=topic_id
-        )
-    except Exception as e:
-        if "message thread not found" in str(e).lower():
-            topic_id = await get_or_create_student_topic(student_id, force_recreate=True)
-
-            await send_content(
-                STAROSTA_CHAT_ID,
-                text=text,
-                file_id=file_id,
-                file_type=file_type,
-                prefix=prefix,
-                message_thread_id=topic_id
-            )
-        else:
-            raise
-
-
-async def send_ticket_card_to_student_topic(student_id, rid, card_text, file_id=None, file_type=None):
-    topic_id = await get_or_create_student_topic(student_id)
-    if not topic_id:
-        raise RuntimeError("Не удалось получить тему студента")
-
-    try:
-        if file_id:
-            if file_type == "photo":
-                sent = await bot.send_photo(
-                    STAROSTA_CHAT_ID,
-                    file_id,
-                    caption=card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-            elif file_type == "video":
-                sent = await bot.send_video(
-                    STAROSTA_CHAT_ID,
-                    file_id,
-                    caption=card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-            elif file_type == "voice":
-                sent = await bot.send_voice(
-                    STAROSTA_CHAT_ID,
-                    file_id,
-                    caption=card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-            elif file_type == "document":
-                sent = await bot.send_document(
-                    STAROSTA_CHAT_ID,
-                    file_id,
-                    caption=card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-            elif file_type == "animation":
-                sent = await bot.send_animation(
-                    STAROSTA_CHAT_ID,
-                    file_id,
-                    caption=card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-            else:
-                sent = await bot.send_message(
-                    STAROSTA_CHAT_ID,
-                    card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-        else:
-            sent = await bot.send_message(
-                STAROSTA_CHAT_ID,
-                card_text,
-                reply_markup=request_keyboard(rid, "new"),
-                message_thread_id=topic_id
-            )
-
-        return sent
-
-    except Exception as e:
-        if "message thread not found" in str(e).lower():
-            topic_id = await get_or_create_student_topic(student_id, force_recreate=True)
-
-            if file_id:
-                if file_type == "photo":
-                    sent = await bot.send_photo(
-                        STAROSTA_CHAT_ID,
-                        file_id,
-                        caption=card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-                elif file_type == "video":
-                    sent = await bot.send_video(
-                        STAROSTA_CHAT_ID,
-                        file_id,
-                        caption=card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-                elif file_type == "voice":
-                    sent = await bot.send_voice(
-                        STAROSTA_CHAT_ID,
-                        file_id,
-                        caption=card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-                elif file_type == "document":
-                    sent = await bot.send_document(
-                        STAROSTA_CHAT_ID,
-                        file_id,
-                        caption=card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-                elif file_type == "animation":
-                    sent = await bot.send_animation(
-                        STAROSTA_CHAT_ID,
-                        file_id,
-                        caption=card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-                else:
-                    sent = await bot.send_message(
-                        STAROSTA_CHAT_ID,
-                        card_text,
-                        reply_markup=request_keyboard(rid, "new"),
-                        message_thread_id=topic_id
-                    )
-            else:
-                sent = await bot.send_message(
-                    STAROSTA_CHAT_ID,
-                    card_text,
-                    reply_markup=request_keyboard(rid, "new"),
-                    message_thread_id=topic_id
-                )
-
-            return sent
-        else:
-            raise
 
     if file_id:
         caption = safe_prefix
@@ -853,7 +534,6 @@ async def setname_command(message: Message):
 
     custom_name = parts[2].strip()
     await set_student_custom_name(student_id, custom_name)
-    await rename_student_topic_if_exists(student_id)
 
     student = await get_student(student_id)
     username = student.get("username") if student else None
@@ -869,19 +549,18 @@ async def handle_student(message: Message):
     if is_admin(message.from_user.id):
         return
 
+    # ⏳ антиспам
     user_id = message.from_user.id
     now = datetime.now().timestamp()
 
-# если это альбом, не режем его кулдауном
-    if not message.media_group_id:
-        if user_id in last_message_time:
-            diff = now - last_message_time[user_id]
-            if diff < COOLDOWN:
-                wait = int(COOLDOWN - diff)
-                await message.answer(f"⏳ Подожди {wait} сек")
-                return
+    if user_id in last_message_time:
+        diff = now - last_message_time[user_id]
+        if diff < COOLDOWN:
+            wait = int(COOLDOWN - diff)
+            await message.answer(f"⏳ Подожди {wait} сек")
+            return
 
-        last_message_time[user_id] = now
+    last_message_time[user_id] = now
 
     await upsert_student(
         student_id=message.from_user.id,
@@ -892,6 +571,9 @@ async def handle_student(message: Message):
     active = await get_active_request(message.from_user.id)
     text, file_id, file_type = extract_message_content(message)
 
+    # =========================
+    # ЕСЛИ ЕСТЬ ТИКЕТ
+    # =========================
     if active:
         rid = active["id"]
 
@@ -904,8 +586,8 @@ async def handle_student(message: Message):
             file_type=file_type
         )
 
-        await send_to_student_topic(
-            message.from_user.id,
+        await send_content(
+            STAROSTA_CHAT_ID,
             text=html.escape(text) if text else "",
             file_id=file_id,
             file_type=file_type,
@@ -918,6 +600,9 @@ async def handle_student(message: Message):
         )
         return
 
+    # =========================
+    # СОЗДАНИЕ ТИКЕТА
+    # =========================
     rid = await create_request(
         message.from_user.id,
         message.from_user.username,
@@ -937,19 +622,47 @@ async def handle_student(message: Message):
     req = await get_request(rid)
     card_text = await format_request_card(req)
 
-    sent = await send_ticket_card_to_student_topic(
-        student_id=message.from_user.id,
-        rid=rid,
-        card_text=card_text,
-        file_id=file_id,
-        file_type=file_type
-    )
+    sent = None
 
-    if sent:
-        if file_id:
+    if file_id:
+        if file_type == "photo":
+            sent = await bot.send_photo(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=card_text,
+                reply_markup=request_keyboard(rid, "new")
+            )
+        elif file_type == "voice":
+            sent = await bot.send_voice(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=card_text,
+                reply_markup=request_keyboard(rid, "new")
+            )
+        elif file_type == "document":
+            sent = await bot.send_document(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=card_text,
+                reply_markup=request_keyboard(rid, "new")
+            )
+        elif file_type == "animation":
+            sent = await bot.send_animation(
+                STAROSTA_CHAT_ID,
+                file_id,
+                caption=card_text,
+                reply_markup=request_keyboard(rid, "new")
+            )
+
+        if sent:
             await set_admin_message_meta(rid, sent.message_id, "caption")
-        else:
-            await set_admin_message_meta(rid, sent.message_id, "text")
+    else:
+        sent = await bot.send_message(
+            STAROSTA_CHAT_ID,
+            card_text,
+            reply_markup=request_keyboard(rid, "new")
+        )
+        await set_admin_message_meta(rid, sent.message_id, "text")
 
     await message.answer(f"✅ Вопрос #{rid} отправлен")
 
